@@ -1,5 +1,4 @@
 local utf8 = require("utf8")
-local inspect = require("inspect")
 
 -- Basic Class Implementation
 
@@ -42,9 +41,10 @@ function TextBuffer:_textPos(row, col)
   return self._font:getWidth(table.concat(self.lines[row], '', 1, col or #self.lines[row]))
 end
 
+-- Expand number of lines due to overflow.
 function TextBuffer:_expand(start)
   local lineCount = #self.lines
-  local i = start
+  local i = start or 1
   while i <= lineCount do
     local cur = self.lines[i]
     local next = self.lines[i + 1] or {}
@@ -86,9 +86,10 @@ local function eat(a, b, font, width)
   return false
 end
 
+-- Shrink number of lines due to underflow.
 function TextBuffer:_shrink(start)
   local lineCount = #self.lines
-  local curi = start
+  local curi = start or 1
   while curi <= lineCount - 1 do
     local cur = self.lines[curi]
     local nexti = curi + 1
@@ -115,11 +116,42 @@ end
 function TextBuffer:initialize(font, width)
   self.lines = { {} }
   self.length = 0
-  self.charPos = {}
-  self._decoding = {}
 
   self._font = font or love.graphics.getFont()
   self._maxWidth = width or love.graphics.getWidth()
+end
+
+function TextBuffer:getFont()
+  return self._font
+end
+
+function TextBuffer:setFont(font)
+  if self._font ~= font then
+    self._font = font
+    self._expand()
+    self._shrink()
+  end
+end
+
+function TextBuffer:getMaxWidth()
+  return self._maxWidth
+end
+
+function TextBuffer:setMaxWidth(width)
+  if self._maxWidth ~= width then
+    local oldWidth = self._maxWidth
+    self._maxWidth = width
+    if width < oldWidth then
+      self:_expand()
+    else
+      self:_shrink()
+    end
+  end
+end
+
+function TextBuffer:getHeight()
+  local height = self._font:getHeight() * self._font:getLineHeight()
+  return self.length > 0 and #self.lines * height or 0
 end
 
 function TextBuffer:colrow(i)
@@ -241,8 +273,8 @@ function TextBuffer:mouseToIdx(x, y)
 end
 
 function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
-  local offX = x or 0
-  local offY = y or 0
+  love.graphics.push()
+  love.graphics.translate(x or 0, y or 0)
   local width = self._maxWidth
   local font = self._font
 
@@ -254,7 +286,7 @@ function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
   end
 
   for ly, line in ipairs(self.lines) do
-    love.graphics.print(line, offX, (ly - 1) * height + offY)
+    love.graphics.print(line, 0, (ly - 1) * height)
   end
 
   -- Draw selection box.
@@ -266,11 +298,11 @@ function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
     local scol, srow = self:colrow(selectStart)
     local ecol, erow = self:colrow(selectEnd)
 
-    local sx = self:_textPos(srow, scol - 1) + offX
-    local ex = self:_textPos(erow, ecol) + offX
+    local sx = self:_textPos(srow, scol - 1)
+    local ex = self:_textPos(erow, ecol)
 
-    local y1 = (srow - 1) * height + offY
-    local y2 = srow * height + offY
+    local y1 = (srow - 1) * height
+    local y2 = srow * height
 
     -- Handle selection on single line.
     if srow == erow then
@@ -283,11 +315,11 @@ function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
       )
     -- Handle selection on multiple lines.
     else
-      local mx1 = offX
-      local mx2 = width + offX
+      local mx1 = 0
+      local mx2 = width
 
-      local y3 = (erow - 1) * height + offY
-      local y4 = erow * height + offY
+      local y3 = (erow - 1) * height
+      local y4 = erow * height
 
       -- Handle two line (no overlap) selection.
       if erow - srow == 1 and ex < sx then
@@ -355,12 +387,14 @@ function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
   -- Draw cursor.
   elseif cursor and cursorIdx then
     local lx, ly = self:colrow(cursorIdx)
-    love.graphics.print(cursor, self:_textPos(ly, lx - 1) + offX, (ly - 1) * height + offY)
+    love.graphics.print(cursor, self:_textPos(ly, lx - 1), (ly - 1) * height)
   end
 
   if oldFont then
     love.graphics.setFont(oldFont)
   end
+
+  love.graphics.pop()
 end
 
 -- Terminal Class
@@ -369,8 +403,30 @@ local Terminal = class("Terminal")
 
 Terminal.TextBuffer = TextBuffer
 
-function Terminal:initialize(font)
+-- Terminal Public API
+
+function Terminal:initialize(font, width, height)
   self.font = font or love.graphics.getFont()
+  self.width = width or love.graphics.getWidth()
+  self.height = height or love.graphics.getHeight()
+  self.x = 0
+  self.y = 0
+  self.backgroundColor = {0, 0, 0, 0}
+
+  self.inputBuffer = self.TextBuffer(self.font, self.width)
+  self.outputBuffer = self.TextBuffer(self.font, self.width)
+end
+
+function Terminal:draw()
+  love.graphics.push('all')
+  love.graphics.setFont(self.font)
+  love.graphics.setBackgroundColor(self.backgroundColor)
+
+  self.outputBuffer:draw()
+  love.graphics.translate(0, self.outputBuffer:getHeight())
+  self.inputBuffer:draw()
+
+  love.graphics.pop()
 end
 
 return Terminal
