@@ -1,10 +1,7 @@
---[[
-Utility Functions
---]]
+local utf8 = require("utf8")
+local inspect = require("inspect")
 
---[[
-Basic Class Implementation
---]]
+-- Basic Class Implementation
 
 local function call(t, ...)
   return t.new(...)
@@ -32,18 +29,97 @@ local function class(name)
   return new_class
 end
 
---[[
-TextBuffer Class
---]]
+-- TextBuffer Class
 
 local TextBuffer = class("TextBuffer")
 
-function TextBuffer:initialize()
+TextBuffer.DEFAULT_REPLACEMENT = "�"
+
+-- TextBuffer Internal API
+
+-- Returns width of row from start to col.
+function TextBuffer:_textPos(row, col)
+  return self._font:getWidth(table.concat(self.lines[row], '', 1, col or #self.lines[row]))
+end
+
+function TextBuffer:_expand(start)
+  local lineCount = #self.lines
+  local i = start
+  while i <= lineCount do
+    local cur = self.lines[i]
+    local next = self.lines[i + 1] or {}
+
+    if self._font:getWidth(table.concat(cur)) > self._maxWidth then
+      while #cur > 0 and self._font:getWidth(table.concat(cur)) > self._maxWidth do
+        table.insert(next, 1, table.remove(cur))
+      end
+
+      if i + 1 > lineCount then
+        table.insert(self.lines, next)
+        lineCount = lineCount + 1
+      end
+    else
+      return
+    end
+
+    i = i + 1
+  end
+end
+
+local function eat(a, b, font, width)
+  if not a or not b then
+    return false
+  end
+
+  local once = false
+  while font:getWidth(table.concat(a)) < width do
+    if #b == 0 then
+      return true
+    end
+    table.insert(a, table.remove(b, 1))
+    once = true
+  end
+
+  if once then
+    table.insert(b, 1, table.remove(a))
+  end
+  return false
+end
+
+function TextBuffer:_shrink(start)
+  local lineCount = #self.lines
+  local curi = start
+  while curi <= lineCount - 1 do
+    local cur = self.lines[curi]
+    local nexti = curi + 1
+    local next = self.lines[nexti]
+
+    while eat(cur, next, self._font, self._maxWidth) do
+      nexti = nexti + 1
+      next = self.lines[nexti]
+    end
+
+    curi = curi + 1
+  end
+
+  -- Remove empty lines.
+  for i = #self.lines, 1, -1 do
+    if #self.lines[i] == 0 then
+      table.remove(self.lines, i)
+    end
+  end
+end
+
+-- TextBuffer Public API
+
+function TextBuffer:initialize(font, width)
   self.lines = { {} }
   self.length = 0
   self.charPos = {}
-  self._prevFont = nil
-  self._prevWidth = nil
+  self._decoding = {}
+
+  self._font = font or love.graphics.getFont()
+  self._maxWidth = width or love.graphics.getWidth()
 end
 
 function TextBuffer:colrow(i)
@@ -58,98 +134,104 @@ function TextBuffer:colrow(i)
   return #self.lines[#self.lines] + 1, #self.lines
 end
 
-function TextBuffer:_refresh(width, font)
-  local lineCount = #self.lines
-  local i = 1
-  while i <= lineCount do
-    local cur = self.lines[i]
-    local next = self.lines[i + 1] or {}
-
-    -- Handle expanding case.
-    if font:getWidth(table.concat(cur)) > width then
-      while #cur > 0 and font:getWidth(table.concat(cur)) > width do
-        table.insert(next, 1, table.remove(cur))
-      end
-
-      if i + 1 > lineCount then
-        table.insert(self.lines, next)
-        lineCount = lineCount + 1
-      end
-    -- Handle shrinking case.
-    elseif i ~= lineCount and font:getWidth(table.concat(cur)) < width then
-      local lastJ = 0
-      for j = 1, #next do
-        table.insert(cur, next[j])
-        if font:getWidth(table.concat(cur)) > width then
-          lastJ = j - 1
-          table.remove(cur)
-          break
-        end
-      end
-
-      -- Remove characters that were copied.
-      if lastJ > 0 then
-        for j = lastJ, 1, -1 do
-          table.remove(next, j)
-        end
-
-        if #next == 0 then
-          table.remove(self.lines, i)
-        end
-      end
-    end
-
-    i = i + 1
-  end
-
-  -- Re-assign character positions.
-  local c = 0
-  local cp = {}
-  for _, line in ipairs(self.lines) do
-    for j = 1, #line do
-      c = c + 1
-      cp[c] = font:getWidth(table.concat(line, '', 1, j - 1))
-    end
-  end
-  self.charPos = cp
-end
-
-function TextBuffer:insert(ch, i)
+function TextBuffer:insert(str, i, replacement)
   i = i or self.length + 1
+  replacement = replacement or self.DEFAULT_REPLACEMENT
   local col, row = self:colrow(i)
-  table.insert(self.lines[row], col, ch)
-  self.length = self.length + 1
-  -- self:expand(row)
-  self._dirty = true
+
+  local errs = {}
+  local j = 1
+  while j <= #str do
+    local len, err = utf8.len(str, j)
+    if not len then
+      table.insert(errs, err)
+      j = err + 1
+    else
+      break
+    end
+  end
+
+  local k = 1
+  for _, err in ipairs(errs) do
+    for _, cp in utf8.codes(str, k, err - 1) do
+      table.insert(self.lines[row], col, utf8.char(cp))
+      self.length = self.length + 1
+      col = col + 1
+    end
+
+    table.insert(self.lines[row], col, replacement)
+    self.length = self.length + 1
+    col = col + 1
+    k = err + 1
+  end
+
+  for _, cp in utf8.codes(str, k) do
+    table.insert(self.lines[row], col, utf8.char(cp))
+    self.length = self.length + 1
+    col = col + 1
+  end
+
+  self:_expand(row)
 end
 
-function TextBuffer:remove(i)
+function TextBuffer:remove(i, j)
   if i > self.length or i <= 0 then
     return
   end
 
-  local col, row = self:colrow(i)
-  table.remove(self.lines[row], col)
-  self.length = self.length - 1
-  -- self:shrink(row)
-  self._dirty = true
-end
+  j = j or i
 
-function TextBuffer:mouseToIdx(x, y)
-  if x <= 0 and y <= 0 then
-    return 1
+  if j < i then
+    i, j = j, i
   end
 
-  local height = self._prevFont:getHeight() * self._prevFont:getLineHeight()
+  local scol, srow = self:colrow(i)
+  local ecol, erow = self:colrow(j)
+  -- Handle removing characters from single line.
+  if srow == erow then
+    for col = ecol, scol, -1 do
+      table.remove(self.lines[srow], col)
+    end
+  -- Handle removing characters from multiple lines.
+  else
+    for col = #self.lines[srow], scol, -1 do
+      table.remove(self.lines[srow], col)
+      self.length = self.length - 1
+    end
+
+    for col = ecol, 1, -1 do
+      table.remove(self.lines[erow], col)
+      self.length = self.length - 1
+    end
+
+    for row = erow - 1, srow + 1, -1 do
+      self.length = self.length - #self.lines[row]
+      table.remove(self.lines, row)
+    end
+  end
+
+  self:_shrink(srow)
+end
+
+-- NOTE This does not normalize the mouse coordinates.
+function TextBuffer:mouseToIdx(x, y)
+  local height = self._font:getHeight() * self._font:getLineHeight()
+
   local i = 1
   for row, line in ipairs(self.lines) do
-    if y < row * height and y >= (row - 1) * height then
-      for _ = 1, #line - 1 do
-        if x >= self.charPos[i] and x < self.charPos[i + 1] then
+    if (y < row * height and y >= (row - 1) * height) or row == #self.lines or y < 0 then
+      if x < 0 then
+        return i - 1
+      end
+
+      for col = 1, #line - 1 do
+        if x >= self:_textPos(row, col - 1) and x < self:_textPos(row, col) then
           return i
         end
         i = i + 1
       end
+
+      return i
     else
       i = i + #line
     end
@@ -158,17 +240,11 @@ function TextBuffer:mouseToIdx(x, y)
   return self.length
 end
 
-function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, selectEnd)
+function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
   local offX = x or 0
   local offY = y or 0
-  width = width or love.graphics.getWidth()
-  font = font or love.graphics.getFont()
-  if width ~= self._prevWidth or font ~= self._prevFont or self._dirty then
-    self:_refresh(width, font)
-    self._prevWidth = width
-    self._prevFont = font
-    self._dirty = false
-  end
+  local width = self._maxWidth
+  local font = self._font
 
   local height = font:getHeight() * font:getLineHeight()
   local oldFont
@@ -181,38 +257,29 @@ function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, sele
     love.graphics.print(line, offX, (ly - 1) * height + offY)
   end
 
-  -- Draw cursor
-  if cursor and cursorIdx then
-    local _, ly = self:colrow(cursorIdx)
-    love.graphics.print(cursor, self.charPos[cursorIdx] + offX, (ly - 1) * height + offY)
-  end
-
   -- Draw selection box.
   if selectStart and selectEnd then
     if selectStart > selectEnd then
       selectStart, selectEnd = selectEnd, selectStart
     end
 
-    local _, srow = self:colrow(selectStart)
-    local _, erow = self:colrow(selectEnd)
+    local scol, srow = self:colrow(selectStart)
+    local ecol, erow = self:colrow(selectEnd)
 
-    local sx = self.charPos[selectStart]
-    local ex = self.charPos[selectEnd]
+    local sx = self:_textPos(srow, scol - 1) + offX
+    local ex = self:_textPos(erow, ecol) + offX
 
     local y1 = (srow - 1) * height + offY
     local y2 = srow * height + offY
 
     -- Handle selection on single line.
     if srow == erow then
-      local x1 = sx + offX
-      local x2 = ex + offX
-
       love.graphics.line(
-        x1, y2,
-        x1, y1,
-        x2, y1,
-        x2, y2,
-        x1, y2 -- wrap
+        sx, y2,
+        sx, y1,
+        ex, y1,
+        ex, y2,
+        sx, y2
       )
     -- Handle selection on multiple lines.
     else
@@ -222,7 +289,7 @@ function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, sele
       local y3 = (erow - 1) * height + offY
       local y4 = erow * height + offY
 
-      -- Handle selection on two lines with no overlap.
+      -- Handle two line (no overlap) selection.
       if erow - srow == 1 and ex < sx then
         love.graphics.line(
           sx, y2,
@@ -239,6 +306,38 @@ function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, sele
           mx1, y3,
           ex, y3
         )
+      -- Handle rectangle selection.
+      elseif mx1 == sx and mx2 == ex then
+        love.graphics.line(
+          sx, y1,
+          ex, y1,
+          ex, y4,
+          sx, y4,
+          sx, y1
+        )
+      -- Handle L-shape (bottom) selection.
+      elseif mx1 == sx then
+        love.graphics.line(
+          sx, y1,
+          mx2, y1,
+          mx2, y3,
+          ex, y3,
+          ex, y4,
+          sx, y4,
+          sx, y1
+        )
+      -- Handle L-shape (top) selection.
+      elseif mx2 == ex then
+        love.graphics.line(
+          sx, y2,
+          sx, y1,
+          ex, y1,
+          ex, y4,
+          mx1, y4,
+          mx1, y2,
+          sx, y2
+        )
+      -- Handle N-shape selection.
       else
         love.graphics.line(
           sx, y2,
@@ -253,6 +352,10 @@ function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, sele
         )
       end
     end
+  -- Draw cursor.
+  elseif cursor and cursorIdx then
+    local lx, ly = self:colrow(cursorIdx)
+    love.graphics.print(cursor, self:_textPos(ly, lx - 1) + offX, (ly - 1) * height + offY)
   end
 
   if oldFont then
@@ -260,9 +363,7 @@ function TextBuffer:draw(x, y, width, font, cursor, cursorIdx, selectStart, sele
   end
 end
 
---[[
-Terminal Class
---]]
+-- Terminal Class
 
 local Terminal = class("Terminal")
 
