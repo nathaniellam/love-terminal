@@ -6,12 +6,18 @@ local function call(t, ...)
   return t.new(...)
 end
 
-local class_mt = { __call = call }
-
 local function class(name)
   local new_class = { __class = name }
   new_class.__index = new_class
-  setmetatable(new_class, class_mt)
+  new_class.__tostring = function(t)
+    if t.toString then
+      return t:toString()
+    else
+      return tostring(t)
+    end
+  end
+
+  setmetatable(new_class, { __call = call })
 
   function new_class.new(...)
     local inst = setmetatable({}, new_class)
@@ -108,6 +114,12 @@ function TextBuffer:_shrink(start)
     if #self.lines[i] == 0 then
       table.remove(self.lines, i)
     end
+  end
+end
+
+function TextBuffer:_append(buf)
+  for _, line in ipairs(buf.lines) do
+    table.insert(self.lines, line)
   end
 end
 
@@ -397,11 +409,35 @@ function TextBuffer:draw(x, y, cursor, cursorIdx, selectStart, selectEnd)
   love.graphics.pop()
 end
 
+function TextBuffer:toString(i, j)
+  i = i or 1
+  j = j or self.length
+  local sx, sy = self:colrow(i)
+  local ex, ey = self:colrow(j)
+  local tmp = {}
+  for y, line in ipairs(self.lines) do
+    if y == sy and y == ey then
+      table.insert(tmp, table.concat(line, '', sx, ex))
+      break
+    elseif y == sy then
+      table.insert(tmp, table.concat(line, '', sx))
+    elseif y == ey then
+      table.insert(tmp, table.concat(line, '', 1, ex))
+      break
+    else
+      table.insert(tmp, table.concat(line))
+    end
+  end
+
+  return table.concat(tmp)
+end
+
 -- Terminal Class
 
 local Terminal = class("Terminal")
 
 Terminal.TextBuffer = TextBuffer
+Terminal.DEFAULT_CURSOR = '_'
 
 -- Terminal Public API
 
@@ -412,19 +448,166 @@ function Terminal:initialize(font, width, height)
   self.x = 0
   self.y = 0
   self.backgroundColor = {0, 0, 0, 0}
+  self.cursorPos = 1
+  self.selection = {}
 
-  self.inputBuffer = self.TextBuffer(self.font, self.width)
-  self.outputBuffer = self.TextBuffer(self.font, self.width)
+  self.input = self.TextBuffer(self.font, self.width)
+  self.output = {}
+end
+
+function Terminal:insert(str)
+  if self.selection[2] == self.input and self.selection[4] == self.input then
+    self:remove()
+  end
+
+  local before = self.input.length
+  self.input:insert(str, self.cursorPos, self.replacementChar)
+  self.cursorPos = self.cursorPos + (self.input.length - before)
+end
+
+function Terminal:remove()
+  if self.selection[2] == self.input and self.selection[4] == self.input then
+    self.input:remove(self.selection[1], self.selection[3])
+    self.selection = {}
+  else
+    self.input:remove(self.cursorPos)
+  end
+end
+
+function Terminal:moveCursor(i)
+  self.cursorPos = math.max(math.min(self.cursorPos + i, self.input.length + 1), 1)
+end
+
+function Terminal:selectStart(x, y)
+  x = x - self.x
+  y = y - self.y
+
+  for _, buffer in ipairs(self.output) do
+    if (y >= 0 and y < buffer:getHeight()) or y < 0 then
+      self.selection = { buffer:mouseToIdx(x, y), buffer }
+      return
+    else
+      y = y - buffer:getHeight()
+    end
+  end
+
+  self.selection = { self.input:mouseToIdx(x, y), self.input }
+  self.cursorPos = self.selection[1]
+end
+
+function Terminal:selectEnd(x, y)
+  x = x - self.x
+  y = y - self.y
+
+  for _, buffer in ipairs(self.output) do
+    if (y >= 0 and y < buffer:getHeight()) or y < 0 then
+      self.selection[3] = buffer:mouseToIdx(x, y)
+      self.selection[4] = buffer
+      return
+    else
+      y = y - buffer:getHeight()
+    end
+  end
+
+  self.selection[3] = self.input:mouseToIdx(x, y)
+  self.selection[4] = self.input
+end
+
+function Terminal:copy()
+  local text = {}
+  local start = false
+  for _, buffer in ipairs(self.output) do
+    if self.selection[2] == buffer and self.selection[4] == buffer then
+      table.insert(text, buffer:toString(self.selection[1], self.selection[3]))
+      break
+    elseif self.selection[2] == buffer then
+      table.insert(text, buffer:toString(self.selection[1]))
+      start = true
+    elseif self.selection[4] == buffer then
+      table.insert(text, buffer:toString(1, self.selection[3]))
+      break
+    elseif start then
+      table.insert(text, buffer:toString())
+    end
+  end
+
+  if self.selection[2] == self.input and self.selection[4] == self.input then
+    table.insert(text, self.input:toString(self.selection[1], self.selection[3]))
+  elseif self.selection[4] == self.input then
+    table.insert(text, self.input:toString(1, self.selection[3]))
+  end
+
+  love.system.setClipboardText(table.concat(text))
+end
+
+function Terminal:paste()
+  local text = love.system.getClipboardText()
+  self:insert(text)
+end
+
+function Terminal:print(...)
+  local params = { n = select('#', ...), ...}
+  for i = 1, params.n do
+    if type(params[i]) ~= 'string' then
+      params[i] = tostring(params[i])
+    end
+  end
+
+  local textbuffer = self.TextBuffer(self.font, self.width)
+  textbuffer:insert(table.concat(params, '\t'))
+  table.insert(self.output, textbuffer)
+end
+
+function Terminal:execute()
+  if self.input.length == 0 then
+    self:print('\n')
+    return
+  end
+
+  local inputStr = tostring(self.input)
+  table.insert(self.output, self.input)
+  local chunk, err = loadstring(inputStr)
+  if chunk then
+    self:print(chunk())
+  else
+    self:print(err)
+  end
+
+  self.input = self.TextBuffer(self.font, self.width)
 end
 
 function Terminal:draw()
   love.graphics.push('all')
   love.graphics.setFont(self.font)
   love.graphics.setBackgroundColor(self.backgroundColor)
+  love.graphics.translate(self.x, self.y)
 
-  self.outputBuffer:draw()
-  love.graphics.translate(0, self.outputBuffer:getHeight())
-  self.inputBuffer:draw()
+  local select = false
+  for _, buffer in ipairs(self.output) do
+    if self.selection[2] == buffer and self.selection[4] == buffer then
+      buffer:draw(0, 0, nil, nil, self.selection[1], self.selection[3])
+    elseif self.selection[2] == buffer then
+      select = true
+      buffer:draw(0, 0, nil, nil, self.selection[1], buffer.length)
+    elseif self.selection[4] == buffer then
+      select = false
+      buffer:draw(0, 0, nil, nil, 1, self.selection[3])
+    elseif select then
+      buffer:draw(0, 0, nil, nil, 1, buffer.length)
+    else
+      buffer:draw()
+    end
+
+    love.graphics.translate(0, buffer:getHeight())
+  end
+
+  if self.selection[2] == self.input and self.selection[4] == self.input then
+    self.input:draw(0, 0, nil, nil, self.selection[1], self.selection[3])
+  elseif self.selection[4] == self.input then
+    self.input:draw(0, 0, nil, nil, 1, self.selection[3])
+  else
+    self.input:draw(0, 0, self.cursor or self.DEFAULT_CURSOR, self.cursorPos)
+  end
 
   love.graphics.pop()
 end
